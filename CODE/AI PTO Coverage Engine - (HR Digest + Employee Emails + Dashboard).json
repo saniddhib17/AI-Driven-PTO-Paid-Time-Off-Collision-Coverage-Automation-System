@@ -1,0 +1,528 @@
+{
+  "name": "AI PTO Coverage Engine - Full (Option A - HR Digest + Employee Emails + Dashboard)",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// -----------------------------\n// Select Candidates (robust)\n// Mode: Run For Each Item\n// Input (per item): expects $json.group (array of absent employees for that collision)\n// -----------------------------\n\n// helper to safely get all rows from the sheet node (replace name if needed)\nfunction getAllSheetRows() {\n  try {\n    // Use the exact node name that reads the sheet\n    return $items(\"Get row(s) in sheet1\").map(i => i.json);\n  } catch (err) {\n    // fallback: try to get items from previous nodes (if names differ)\n    try {\n      return $items().map(i => i.json);\n    } catch (e) {\n      return [];\n    }\n  }\n}\n\nconst allEmployees = getAllSheetRows();\nif (!Array.isArray(allEmployees)) {\n  throw new Error(\"allEmployees is not an array — check your sheet node name.\");\n}\n\n// The incoming item should contain a 'group' array (employees off on the same date)\n// if not, try to use $json directly as a single target\nconst input = $json;\nconst group = Array.isArray(input.group) ? input.group : [ input ];\n\n// We'll return one output per target in the group\nconst outputs = [];\n\ngroup.forEach(target => {\n  const targetDate = String(target.pto_date || \"\").trim();\n  const team = target.team;\n\n  // Filter rules:\n  // - same team\n  // - not the target person\n  // - candidate NOT on PTO that date\n  // - availability \"Available\"\n  // - optional: reasonable workload threshold (< 0.9)\n  let candidates = allEmployees.filter(e => {\n    try {\n      // normalize fields to strings/numbers\n      const sameTeam = String(e.team || \"\").trim() === String(team || \"\").trim();\n      const notSamePerson = String(e.employee || \"\").trim() !== String(target.employee || \"\").trim();\n      const pto = String(e.pto_date || \"\").trim();\n      const notOnPTOThatDay = pto === \"\" || pto !== targetDate; // allow empty pto_date (means not on PTO)\n      const isAvailable = String((e.availability || \"\")).toLowerCase() === \"available\";\n      const workload = Number(e.workload || 0);\n      const workloadOk = isNaN(workload) ? true : (workload < 0.9);\n\n      return sameTeam && notSamePerson && notOnPTOThatDay && isAvailable && workloadOk;\n    } catch (err) {\n      return false;\n    }\n  });\n\n  // Optional: sort by past_coverage_score desc, then lowest workload\n  candidates.sort((a,b) => {\n    const scoreA = Number(a.past_coverage_score || 0);\n    const scoreB = Number(b.past_coverage_score || 0);\n    if (scoreB !== scoreA) return scoreB - scoreA;\n    const wA = Number(a.workload || 0);\n    const wB = Number(b.workload || 0);\n    return wA - wB;\n  });\n\n  outputs.push({\n    json: {\n      target,\n      date: targetDate,\n      team,\n      candidates\n    }\n  });\n});\n\nreturn outputs;\n\n\n"
+      },
+      "id": "df0fb913-3ed3-40a3-9f83-9b18e2ce201f",
+      "name": "Select Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2112,
+        1856
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Deterministic scoring for PTO coverage selection\n * Input:\n *   target      – the absent employee\n *   candidates  – filtered list from the previous node\n *\n * Output:\n *   - target\n *   - candidates\n *   - deterministicCover\n *   - final_cover (if HR manual cover exists)\n *   - reason_factors\n */\n\nconst target = $json.target;\nconst candidates = $json.candidates;\n\n// 🟦 If no candidates exist\nif (!candidates || candidates.length === 0) {\n  return [{\n    json: {\n      target,\n      candidates: [],\n      deterministicCover: null,\n      final_cover: null,\n      reason_factors: { message: \"No available candidates\" }\n    }\n  }];\n}\n\n// --------------------------------------------------------\n// SCORING LOGIC (modify weights if needed)\n// --------------------------------------------------------\nfunction computeScore(candidate, target) {\n  let score = 0;\n\n  // 1️⃣ Skillset Match (heavily weighted)\n  const tSkills = String(target.skillset || \"\").toLowerCase().split(\",\");\n  const cSkills = String(candidate.skillset || \"\").toLowerCase().split(\",\");\n\n  let overlap = cSkills.filter(s => tSkills.includes(s.trim())).length;\n  score += overlap * 100; // weight: 100 per matching skill\n\n  // 2️⃣ Past Coverage Experience\n  let past = Number(candidate.past_coverage_score || 0);\n  score += past * 50;\n\n  // 3️⃣ Workload (lower workload = better)\n  let workload = Number(candidate.workload || 0);\n  score += (1 - workload) * 40; \n\n  // 4️⃣ Criticality: prefer LOW criticality\n  const crit = String(candidate.criticality || \"\").toLowerCase();\n  const critWeight = { low: 40, medium: 20, high: 0 };\n  score += critWeight[crit] || 0;\n\n  return score;\n}\n\n// --------------------------------------------------------\n// Rank all candidates\n// --------------------------------------------------------\nlet scored = candidates.map(c => {\n  return {\n    ...c,\n    score: computeScore(c, target)\n  };\n});\n\n// Sort by score ↓\nscored.sort((a, b) => b.score - a.score);\n\n// Best deterministic pick\nconst best = scored[0];\n\n// HR manual override (if provided)\nconst final_cover = target.hr_manual_cover && target.hr_manual_cover.trim() !== \"\"\n  ? target.hr_manual_cover\n  : best.employee;\n\n// Reason factors (sent to Gemini later)\nconst reason_factors = {\n  top_skill_overlap: String(best.skillset),\n  target_skillset: String(target.skillset),\n  past_coverage_score: best.past_coverage_score,\n  workload: best.workload,\n  score: best.score\n};\n\nreturn [{\n  json: {\n    target,\n    candidates: scored,\n    deterministicCover: best.employee,\n    final_cover,\n    reason_factors\n  }\n}];\n"
+      },
+      "id": "95ccb28c-b5a3-4508-a627-38630641cc54",
+      "name": "Deterministic Scoring",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1824,
+        1856
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [\n  {\n    json: {\n      explanation: $json.content?.parts?.[0]?.text || \"\"\n    }\n  }\n];\n"
+      },
+      "id": "aacd15d0-0445-4ec8-91cc-33927b94160f",
+      "name": "Extract AI text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1216,
+        1856
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "subject": "Your PTO overlaps with colleagues — please review",
+        "includeHtml": true,
+        "htmlMessage": "=<p>Hello {{ $json.Employee }},</p>\n\n<p>\nThis is a reminder regarding your upcoming \n<strong>PTO scheduled on {{ $json.Date }}</strong>.\n</p>\n\n<p>\nOur system detected an overlap in the <strong>{{ $json.Team }}</strong> team’s availability.  \n\nTo ensure business continuity and uninterrupted workflow, \n<strong>{{ $json['final_cover '] }}</strong> has been assigned to provide coverage during your absence.\n</p>\n\n<p>\n<strong>Assigned Cover:</strong> {{ $json['final_cover '] }}\n</p>\n\n<p>\nPlease ensure you align with the coverage plan and notify your manager \nif any adjustments are needed.\n</p>\n\n<p>\nThank you,<br>\n<strong>HR Operations</strong>\n</p>\n",
+        "message": "=\n\n",
+        "toList": [
+          "daretodream14sb@gmail.com"
+        ],
+        "additionalFields": {}
+      },
+      "id": "c1d6d2dd-9e11-4ab4-b6c6-ba0b6c8e02fb",
+      "name": "Send Employee Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 1,
+      "position": [
+        -304,
+        1600
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "EveWTmKGD76w98wB",
+          "name": "Gmail account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "subject": "=PTO Collision Review Required: {{ $json.target.team }} Team",
+        "includeHtml": true,
+        "htmlMessage": "=<p><strong> PTO Collision Summary – {{ $json.target.team }} Team</strong></p>\n\n<p> Dear Hr </p>\n<p>An employee will be out on: <strong>{{ $json.target.pto_date }}</strong></p>\n\n<p>Details:</p>\n\n<ul>\n  <li><strong>Employee:</strong> {{ $json.target.employee }}</li>\n  <li><strong>Recommended by Deterministic Model:</strong> {{ $json.deterministicCover }}</li>\n  <li><strong>HR Manual Override:</strong> {{ $json.target.hr_manual_cover }}</li>\n  <li><strong>Final Coverage Assigned:</strong> <strong>{{ $json.final_cover }}</strong></li>\n</ul>\n\n<p><strong>Explanation:</strong><br>\n{{ $json.explanation }}\n</p>\n\n<p>Please review and acknowledge if further changes are required.</p>\n\n<p>— Automated HR PTO System</p>\n",
+        "message": "=\n\n",
+        "toList": [
+          "daretodream14sb@gmail.com"
+        ],
+        "additionalFields": {}
+      },
+      "id": "acf36344-072a-41ab-ae19-dc5337ac730c",
+      "name": "Send HR Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 1,
+      "position": [
+        -560,
+        1824
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "EveWTmKGD76w98wB",
+          "name": "Gmail account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/*\n  Input: items from Read PTO Data (all rows)\n  Output: one item per absent employee with fields:\n    - group: array of absent rows for same date+team\n    - target: the absent row (the employee who is out and needs coverage)\n    - all_rows: full sheet rows (for candidate lookup)\n*/\nconst rows = items.map(i => i.json || {});\n// normalize pto_date presence (treat blank as none)\nconst PTOrows = rows.filter(r => r.pto_date && String(r.pto_date).toString().trim() !== '');\nconst groups = {};\nfor (const r of PTOrows) {\n  const key = `${r.pto_date}_${r.team}`;\n  if (!groups[key]) groups[key] = [];\n  groups[key].push(r);\n}\nconst out = [];\nObject.values(groups).forEach(group => {\n  // for each absent employee in that group, create a work item\n  group.forEach(target => {\n    out.push({ json: { group, target, all_rows: rows } });\n  });\n});\nreturn out;"
+      },
+      "id": "214cb31e-83d4-49c2-a17f-75713f6b6535",
+      "name": "Group PTO by date+team & explode per absent1",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -2672,
+        1856
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$json[\"group\"].length}}",
+              "operation": "larger",
+              "value2": 1
+            }
+          ]
+        }
+      },
+      "id": "56082bbd-1bf7-408e-a657-a18e52253a93",
+      "name": "If group.length > 1 (Collision?)1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -2432,
+        1856
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": "models/gemini-2.5-flash",
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an HR Operations Assistant.\n\nYour task is to write a concise, professional 2–3 sentence explanation describing the PTO coverage decision.\n\nIMPORTANT RULES:\n- Do NOT change the chosen cover.\n- Do NOT list or suggest alternative candidates.\n- Do NOT invent new names.\n- Do NOT output JSON or bullet points.\n- Write in natural, business-friendly English.\n\nCONTEXT:\nThe absent employee is {{ $json.target.employee }} from the {{ $json.target.team }} team, who will be on PTO on {{ $json.target.pto_date }}.\nA deterministic scoring model evaluated all eligible candidates based on skill alignment, workload balance, availability, and past coverage performance.\nThe model’s top recommendation was: {{ $json.deterministicCover }}.\n\nIf HR provided a manual override, it is recorded here:\nHR override: {{ $json.target.hr_manual_cover }}.\n\nThe final approved cover is:\n{{ $json.final_cover }}.\n\nREASON FACTORS (for context only — summarize naturally):\n{{ $json.reason_factors }}\n\nTASK:\nWrite a clear, factual 2–3 sentence explanation that:\n- Mentions the absent employee, their team, and their PTO date.\n- States the final cover employee.\n- Distinguishes between the deterministic recommendation and the HR override (if applicable).\n- Explains why the final cover is appropriate, referencing skills, workload, or availability in simple terms.\n\nDo not include any internal variables or formatting. Produce a plain-text explanation only.\n\n"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "56e7a8ad-3b94-4ad0-98d1-ecbc0d159235",
+      "name": "Message a model1",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1520,
+        1856
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "pn5fbfTPtQSuAnbL",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ",
+          "mode": "list",
+          "cachedResultName": "pto",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 334147071,
+          "mode": "list",
+          "cachedResultName": "pto",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ/edit#gid=334147071"
+        },
+        "options": {}
+      },
+      "id": "5a9dba6e-ef9b-46fa-a443-a1e84d9f6163",
+      "name": "Get row(s) in sheet1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        -2912,
+        1856
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "lIZbknxRbuPyBxvp",
+          "name": "Google Sheets account 3"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -1008,
+        1600
+      ],
+      "id": "7fd29720-7686-4d09-ae2d-c5fa3779ee48",
+      "name": "Merge2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const det = items[1].json; // deterministic output\n\n// LLM explanation exists here:\nconst llm = items[0].json;\n\n// read the Gemini text safely:\nconst explanation =\n    llm.parts?.[0]?.text  // correct location\n    || llm.explanation     // fallback\n    || llm.text            // fallback\n    || \"\";\n\n// return merged structure\nreturn [\n  {\n    json: {\n      ...det,\n      explanation\n    }\n  }\n];\n\n\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        1600
+      ],
+      "id": "bc54a4e4-ac81-49eb-83d1-59a5111e9bb4",
+      "name": "Code in JavaScript2"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ",
+          "mode": "list",
+          "cachedResultName": "PTO_FINAL_coverage",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 989068885,
+          "mode": "list",
+          "cachedResultName": "PTO_dashboard",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ/edit#gid=989068885"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Employee": "={{ $json.target.employee }}",
+            "Team": "={{$json.target.team}}",
+            "Date": "={{ $json.target.pto_date }}",
+            "Deterministic_Cover ": "={{ $json.deterministicCover }}",
+            "hr_manual_cover   ": "={{ $json.target.hr_manual_cover }}",
+            "final_cover ": "={{ $json.final_cover }}",
+            "explanation   ": "={{ $json.explanation }}",
+            "risk_level  ": "=={{ $json.candidates.length > 2 ? \"Low\" : \"High\" }}"
+          },
+          "matchingColumns": [
+            "Employee"
+          ],
+          "schema": [
+            {
+              "id": "Employee",
+              "displayName": "Employee",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Date",
+              "displayName": "Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Team",
+              "displayName": "Team",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Deterministic_Cover ",
+              "displayName": "Deterministic_Cover ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hr_manual_cover   ",
+              "displayName": "hr_manual_cover   ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "final_cover ",
+              "displayName": "final_cover ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_level  ",
+              "displayName": "risk_level  ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "explanation   ",
+              "displayName": "explanation   ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -576,
+        1600
+      ],
+      "id": "b29e5bbe-96f5-4ecc-b322-d5603b368e1d",
+      "name": "Append or update row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "lIZbknxRbuPyBxvp",
+          "name": "Google Sheets account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {}
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "value": "1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ",
+          "mode": "list",
+          "cachedResultName": "PTO_FINAL_coverage",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 334147071,
+          "mode": "list",
+          "cachedResultName": "pto",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1u53Dz-6mEChfeHVLNnutDGd_yce5IprPffMrrucp5uQ/edit#gid=334147071"
+        },
+        "includeInOutput": "both",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        -3152,
+        1856
+      ],
+      "id": "3bd19da0-5dfb-48fd-9197-6405022c5e59",
+      "name": "Google Sheets Trigger",
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "67Xrd8OC56XDESML",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Select Candidates": {
+      "main": [
+        [
+          {
+            "node": "Deterministic Scoring",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deterministic Scoring": {
+      "main": [
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Extract AI text": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group PTO by date+team & explode per absent1": {
+      "main": [
+        [
+          {
+            "node": "If group.length > 1 (Collision?)1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If group.length > 1 (Collision?)1": {
+      "main": [
+        [
+          {
+            "node": "Select Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model1": {
+      "main": [
+        [
+          {
+            "node": "Extract AI text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet1": {
+      "main": [
+        [
+          {
+            "node": "Group PTO by date+team & explode per absent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge2": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript2": {
+      "main": [
+        [
+          {
+            "node": "Append or update row in sheet",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send HR Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append or update row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Send Employee Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "d1e3df9b-86d2-4cbb-adff-9f1e71be1aa7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "b1176b30b2f39f1c56dd6afe9051b2cb80d5bbfd31ca24671656dfb9ed871430"
+  },
+  "id": "uzaDrGftOSTQTvsk",
+  "tags": []
+}
